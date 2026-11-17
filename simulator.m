@@ -15,29 +15,30 @@ function out = LaserSpeakerSimulator(varargin)
 %   Requires MATLAB R2020b or newer (uifigure / uigridlayout). No toolboxes.
 %
 %   MODEL SUMMARY (all constants are ESTIMATES unless measured)
-%     Tone      : u(t) = sum_n b_n sin(2*pi*n*f*t), band-limited Fourier series
-%                 of sine / square / triangle / sawtooth.
+%     Tone      : phase-continuous band-limited Fourier series of sine /
+%                 square / triangle / sawtooth (frequency changes never
+%                 make the waveform jump, as in a real tone generator).
 %     Amplifier : first-order low-shelf (bass, 100 Hz) and high-shelf (treble,
 %                 10 kHz) equaliser, linear master volume.
 %     Speakers  : each cone is a driven damped oscillator
 %                 m_i s_i'' + c_i s_i' + k_i s_i = F_i(t)
-%                 written as a displacement FRF  A_i / (1 - r^2 + 2 i zeta r).
-%     Mount     : base translation of the woofer cone (y_b = s_out) plus a
-%                 local cone rocking angle psi_b = kappa*s_in/r_tape caused by
-%                 the tweeter (structural coupling) and near-field acoustic
-%                 pressure of the tweeter acting on the mirror face.
-%     Mirror    : 3-DOF rigid body on a cantilevered coil spring,
-%                 q = [z; theta_v; theta_h]  (z = relative tip translation
-%                 along the speaker axis, theta_v = vertical tilt (about the
-%                 horizontal X axis), theta_h = horizontal tilt (about the
-%                 vertical Z axis)):
-%                 M q'' + C q' + K q = -M r_y yb'' - M r_psi psi_b'' + F_ac
-%                 K = series(spring Euler-Bernoulli tip matrix + torsion,
-%                 tape/contact compliance). Proportional (modal) damping.
-%     Solution  : exact frequency-domain steady state per harmonic (stored as
-%                 a one-period lookup table) + exact analytical modal
-%                 transient + narrow-band random base vibration. No ODE
-%                 integration in the animation loop.
+%                 plus small 2nd/3rd-harmonic distortion of the cone motion
+%                 (real drivers and amplifiers are not perfectly linear).
+%     Mount     : base translation of the woofer cone, local cone rocking
+%                 caused by the tweeter, and the tweeter's near-field
+%                 pressure on the mirror face (with acoustic delay).
+%     Mirror    : 3-DOF rigid body on the cantilevered coil spring and a
+%                 compliant tape/contact joint, q = [z; theta_v; theta_h]:
+%                 M q'' + C q' + K q + f_nl(q) = F(t)
+%                 f_nl = k3*(theta_v^2+theta_h^2)*[0; theta_v; theta_h]
+%                 is an isotropic hardening of the compliant contact. It
+%                 makes elliptical orbits precess and lets response
+%                 ellipses open, tilt and jump as the frequency is swept.
+%     Solution  : the full nonlinear model is integrated in real time with
+%                 fixed-step RK4, only over the newly elapsed simulated
+%                 time each frame (never re-integrating history). Linear
+%                 frequency-domain solutions are used for the resonance
+%                 plot, for initial conditions and for verification.
 %     Optics    : exact vector law of reflection d_out = d_in - 2(d_in.n)n,
 %                 ray/mirror-plane and ray/screen-plane intersections.
 %
@@ -58,23 +59,38 @@ end
 % ---------------------------------------------------------------------
 P   = defaultParams();          % user parameters (SI units internally)
 St  = buildStructure(P);        % spring-mirror structural matrices & modes
+Mdl = buildModel(P, St);        % excitation tables for the current tone
 G   = buildGeometry(P);         % optical geometry
 S   = struct();                 % runtime state
 S.t = 0;                        % simulated time (s)
+S.phase = 0;                    % tone phase in cycles, continuous across frequency changes
+S.x = zeros(6, 1);              % state [z; theta_v; theta_h; velocities]
+S.an = 0;                       % current random base acceleration (m/s^2)
+S.rng = RandStream('mt19937ar', 'Seed', 2026);
 S.playing = false;
-S.segs = {};                    % piecewise-constant parameter segments
-S.segStart = zeros(1, 0);       % start time of each segment (s)
-S.noiseSeed = makeNoiseSeed(12);
 S.needRebuild = false;
 S.geoDirty = false;
 S.resDirty = true;
 S.schemDirty = true;
+S.freqWidgetsDirty = false;
 S.frame = 0;
-S.NsMax = 3000;                 % adaptive cap on trail samples per frame
+S.NsMax = 3000;                 % adaptive cap on drawn trail samples
+S.stepBudget = 6000;            % adaptive cap on RK4 steps per frame
+S.simDebt = 0;                  % requested simulated time not yet integrated
+S.cpuLimited = false;
+S.effSpeed = 1;
+S.lastSteps = 0;
+S.lastDt = 0;
+S.ampEst = 0;                   % recent max tilt amplitude (rad), sets the step size
+S.nanReset = false;
+S.sweepDir = 0;                 % -1, 0, +1
 S.lastTic = tic;
-S.viewHalf = P.viewHalf_cm;     % current displayed half-width (cm)
-S.lastStats = struct('len', 0, 'wid', 0, 'ang', 0);
+S.viewHalf = P.viewHalf_cm;
 S.saturated = false;
+S.Nb = 30000;                   % ring-buffer length (samples)
+S.buf = nan(6, S.Nb);           % rows: t, z, theta_v, theta_h, s_out, s_in
+S.bufHead = 0;
+S.bufCount = 0;
 S.timer = [];
 S.verifyFig = [];
 H   = struct();                 % graphics handles
@@ -122,7 +138,7 @@ end
         left.BackgroundColor = CLR.bg;
         left.RowSpacing = 6;
         left.Padding = [0 0 6 0];
-        nRows = [8 4 8 11 7 6 7];
+        nRows = [8 4 10 13 7 8 7];
         left.RowHeight = num2cell(panelHeight(nRows));
 
         buildPanelA(makePanel(left, 1, 'A  Frequency & waveform (tone generator)', nRows(1)));
@@ -130,7 +146,7 @@ end
         buildPanelC(makePanel(left, 3, 'C  Speaker dynamics (both speakers get the same signal)', nRows(3)));
         buildPanelD(makePanel(left, 4, 'D  Tape, 1-inch spring & mirror  [estimated constants]', nRows(4)));
         buildPanelE(makePanel(left, 5, 'E  Laser & screen geometry', nRows(5)));
-        buildPanelF(makePanel(left, 6, 'F  Playback & simulation', nRows(6)));
+        buildPanelF(makePanel(left, 6, 'F  Playback, sweep & simulation', nRows(6)));
         buildPanelG(makePanel(left, 7, 'G  Idealized Lissajous model (comparison only)', nRows(7)));
 
         % ---------------- centre: projection screen ------------------
@@ -278,7 +294,11 @@ end
             @(v) setParam('fs_in', v, 'dyn'));
         addSlider(g, 7, ['Speaker coupling ' GL.kappa], [0 1.5], P.kappa, @(v) sprintf('%.2f', v), ...
             @(v) setParam('kappa', v, 'dyn'));
-        H.spkInfo = addLabel(g, 8, [1 3], '', CLR.value);
+        addSlider(g, 8, '2nd-harmonic distortion', [0 10], P.hd2 * 100, @(v) sprintf('%.1f %%', v), ...
+            @(v) setParam('hd2', v / 100, 'dyn'));
+        addSlider(g, 9, '3rd-harmonic distortion', [0 10], P.hd3 * 100, @(v) sprintf('%.1f %%', v), ...
+            @(v) setParam('hd3', v / 100, 'dyn'));
+        H.spkInfo = addLabel(g, 10, [1 3], '', CLR.value);
     end
 
     % ---------------- Panel D: spring & mirror ------------------------
@@ -297,12 +317,16 @@ end
             @(v) setParam('e_v', v * 1e-3, 'dyn'));
         addSlider(g, 7, ['Cross-axis coupling ' GL.kappa '_c'], [-0.8 0.8], P.kappa_c, @(v) sprintf('%+.2f', v), ...
             @(v) setParam('kappa_c', v, 'dyn'));
-        addSlider(g, 8, ['Initial perturb. ' GL.theta '_0'], [0 50], P.theta0 * 1e3, @(v) sprintf('%.1f mrad', v), ...
+        addSlider(g, 8, ['Torsion/bending ' GL.beta '_t'], [0.2 3], P.beta_t, @(v) sprintf('%.2f', v), ...
+            @(v) setParam('beta_t', v, 'dyn'));
+        addSlider(g, 9, ['Contact hardening ' GL.eta], [0 0.2], P.eta_nl, ...
+            @(v) sprintf('%.0f%% @10mrad', 100 * v), @(v) setParam('eta_nl', v, 'dyn'));
+        addSlider(g, 10, ['Kick size ' GL.theta '_0'], [0 50], P.theta0 * 1e3, @(v) sprintf('%.1f mrad', v), ...
             @(v) setParam('theta0', v * 1e-3, 'none'));
-        H.fnInfo1 = addLabel(g, 9, [1 3], '', CLR.value);
-        H.fnInfo2 = addLabel(g, 10, [1 3], '', CLR.value);
+        H.fnInfo1 = addLabel(g, 11, [1 3], '', CLR.value);
+        H.fnInfo2 = addLabel(g, 12, [1 3], '', CLR.value);
         lg = uigridlayout(g, [1 2]);
-        lg.Layout.Row = 11; lg.Layout.Column = [1 3];
+        lg.Layout.Row = 13; lg.Layout.Column = [1 3];
         lg.ColumnWidth = {22, '1x'}; lg.Padding = [0 0 0 0]; lg.BackgroundColor = CLR.panel;
         H.resLamp = uilamp(lg, 'Color', [0.2 0.8 0.3]);
         H.resLamp.Layout.Row = 1; H.resLamp.Layout.Column = 1;
@@ -322,15 +346,15 @@ end
             @(v) sprintf('%s%.3g cm', char(177), 10^v), @(v) setParam('viewHalf_cm', 10^v, 'none'));
         addSlider(g, 5, 'Exposure / persistence', [log10(1) log10(200)], log10(P.exposure * 1e3), ...
             @(v) sprintf('%.1f ms', 10^v), @(v) setParam('exposure', 10^v * 1e-3, 'none'));
-        addSlider(g, 6, 'Disturbance (base)', [0 2], P.noise, @(v) sprintf('%.2f m/s%s', v, char(178)), ...
-            @(v) setParam('noise', v, 'dyn'));
+        addSlider(g, 6, 'Disturbance (base)', [0 0.5], P.noise, @(v) sprintf('%.3f m/s%s', v, char(178)), ...
+            @(v) setParam('noise', v, 'none'));
         H.autoFit = uicheckbox(g, 'Text', 'Auto-fit screen view to pattern (sizes still reported in cm)', ...
             'Value', P.autoFit, 'FontColor', CLR.text, ...
             'ValueChangedFcn', @(src, ~) setParam('autoFit', src.Value, 'none'));
         H.autoFit.Layout.Row = 7; H.autoFit.Layout.Column = [1 3];
     end
 
-    % ---------------- Panel F: playback -------------------------------
+    % ---------------- Panel F: playback & sweep -----------------------
     function buildPanelF(g)
         bg = uigridlayout(g, [1 5]);
         bg.Layout.Row = [1 2]; bg.Layout.Column = [1 3];
@@ -342,15 +366,24 @@ end
         addButton(bg, 1, 3, 'Reset', @() onReset());
         addButton(bg, 1, 4, 'Kick', @() onKick());
         addButton(bg, 1, 5, 'Verify', @() showVerification());
-        addSlider(g, 3, 'Simulation speed', [-4 0], log10(P.speed), ...
+        sg = uigridlayout(g, [1 3]);
+        sg.Layout.Row = 3; sg.Layout.Column = [1 3];
+        sg.ColumnWidth = {'1x', '1x', '1x'};
+        sg.Padding = [0 0 0 0]; sg.ColumnSpacing = 4; sg.BackgroundColor = CLR.panel;
+        H.sweepUpBtn = addButton(sg, 1, 1, ['Sweep ' char(9650)], @() startSweep(1));
+        H.sweepDnBtn = addButton(sg, 1, 2, ['Sweep ' char(9660)], @() startSweep(-1));
+        addButton(sg, 1, 3, 'Stop sweep', @() stopSweep());
+        addSlider(g, 4, 'Sweep rate', [log10(0.1) log10(12)], log10(P.sweepRate), ...
+            @(v) sprintf('%.2g st/s', 10^v), @(v) setParam('sweepRate', 10^v, 'none'));
+        addSlider(g, 5, 'Simulation speed', [-3 0], log10(P.speed), ...
             @(v) sprintf('%.3g%s', 10^v, GL.times), @(v) setParam('speed', 10^v, 'none'));
-        H.modeDrop = addDropdown(g, 4, 'Display model', ...
+        H.modeDrop = addDropdown(g, 6, 'Display model', ...
             {'Physics model (speaker-spring-mirror)', 'Idealized Lissajous (comparison)'}, ...
             {'Physics', 'Lissajous'}, P.mode, @(v) setParam('mode', v, 'none'));
         H.show3D = uicheckbox(g, 'Text', 'Update 3D schematic', 'Value', P.show3D, ...
             'FontColor', CLR.text, 'ValueChangedFcn', @(src, ~) setParam('show3D', src.Value, 'none'));
-        H.show3D.Layout.Row = 5; H.show3D.Layout.Column = [1 2];
-        H.timeLbl = addLabel(g, 6, [1 3], '', CLR.value);
+        H.show3D.Layout.Row = 7; H.show3D.Layout.Column = [1 2];
+        H.timeLbl = addLabel(g, 8, [1 3], '', CLR.value);
     end
 
     % ---------------- Panel G: idealized Lissajous --------------------
@@ -443,9 +476,9 @@ end
     % ---------------- Resonance tab -----------------------------------
     function buildResonanceTab(tab)
         g = uigridlayout(tab, [2 1]);
-        g.RowHeight = {'1x', 60};
+        g.RowHeight = {'1x', 76};
         g.BackgroundColor = CLR.bg; g.Padding = [4 4 4 4];
-        H.axRes = darkAxes(g, 1, 'Steady-state response to a sine at the current amplifier settings', ...
+        H.axRes = darkAxes(g, 1, 'Small-signal (linear) response to a sine at the current amplifier settings', ...
             'drive frequency (Hz)', 'amplitude');
         H.axRes.XScale = 'log'; H.axRes.YScale = 'log';
         H.axRes.XLim = [1 P.fMax];
@@ -525,8 +558,15 @@ end
     end
 
     function processPending()
+        % Model rebuilds keep the mechanical state and the tone phase, so
+        % any change is followed by the physical (integrated) response.
         if S.needRebuild
-            applyDynamics();
+            St = buildStructure(P);
+            Mdl = buildModel(P, St);
+            G = buildGeometry(P);
+            S.needRebuild = false;
+            S.resDirty = true;
+            updateReadouts();
         end
         if S.geoDirty
             G = buildGeometry(P);
@@ -535,58 +575,26 @@ end
         end
     end
 
-    function applyDynamics()
-        % Rebuild the model and start a new segment at the current time.
-        % State continuity: the old segment's state at t_c becomes the new
-        % initial condition; the difference from the new steady state is
-        % carried by an exact free (transient) response.
-        St = buildStructure(P);
-        G = buildGeometry(P);
-        newM = buildModel(P, St, S.noiseSeed);
-        if isempty(S.segs)
-            xOld = zeros(6, 1);
-        else
-            xOld = segmentState(S.segs{end}, S.t);
-        end
-        newM = setTransient(newM, S.t, xOld - ssStateVec(newM, S.t));
-        pushSegment(newM);
-        S.needRebuild = false;
-        S.resDirty = true;
-        updateReadouts();
-    end
-
-    function pushSegment(Mdl)
-        if ~isempty(S.segStart) && S.segStart(end) >= S.t
-            keep = S.segStart < S.t;
-            S.segs = S.segs(keep);
-            S.segStart = S.segStart(keep);
-        end
-        S.segs{end + 1} = Mdl;
-        S.segStart(end + 1) = S.t;
-        horizon = S.t - 1.0;        % simulated seconds of history kept
-        while numel(S.segStart) >= 2 && S.segStart(2) <= horizon
-            S.segs(1) = [];
-            S.segStart(1) = [];
-        end
-        if numel(S.segs) > 80
-            S.segs = S.segs(end - 79:end);
-            S.segStart = S.segStart(end - 79:end);
-        end
-    end
-
     function resetSimulation()
-        % Sound switched on at t = 0 with the mirror at rest, plus the
-        % user-selected initial angular perturbation theta_0.
-        S.t = 0;
-        S.segs = {};
-        S.segStart = zeros(1, 0);
+        % Tone running at t = 0 with the mirror on its small-signal steady
+        % state; the nonlinear integration then takes over.
         St = buildStructure(P);
+        Mdl = buildModel(P, St);
         G = buildGeometry(P);
-        M0 = buildModel(P, St, S.noiseSeed);
-        xStart = [0; P.theta0; 0.7 * P.theta0; 0; 0; 0];
-        M0 = setTransient(M0, 0, xStart - ssStateVec(M0, 0));
-        S.segs = {M0};
-        S.segStart = 0;
+        S.t = 0;
+        S.phase = 0;
+        S.an = 0;
+        S.simDebt = 0;
+        S.x = ssStatePhase(Mdl, 0);
+        S.ampEst = max(abs(S.x(2:3)));
+        S.ampEst = max(S.ampEst, sum(max(abs(Mdl.QF(2:3, :)), [], 1)));
+        % pre-fill the persistence buffer with the same steady state
+        S.buf(:) = NaN; S.bufHead = 0; S.bufCount = 0;
+        dt0 = stepSize(Mdl, P, S.ampEst);
+        nPre = min(floor(P.exposure / dt0) + 1, floor(S.Nb / 2));
+        tPre = -(nPre - 1:-1:0) * dt0;
+        phPre = mod(Mdl.f * tPre, 1);
+        bufAppend([tPre; tableEval(Mdl.qL, phPre); tableEval(Mdl.sL, phPre)]);
         S.needRebuild = false;
         S.geoDirty = false;
         S.resDirty = true;
@@ -594,20 +602,22 @@ end
     end
 
     function onReset()
+        stopSweep();
         resetSimulation();
         updateReadouts();
         renderFrame(true);
     end
 
     function onKick()
-        % Impulsive angular disturbance (e.g. a tap on the speaker).
+        % A tap on the speaker: an angular velocity impulse. The free
+        % ringing beats with the forced motion and, with contact hardening,
+        % elliptical orbits precess, so the figure visibly turns.
         processPending();
-        Mdl = S.segs{end};
-        xNow = segmentState(Mdl, S.t);
-        dx = [0; P.theta0; -0.7 * P.theta0; 0; 0; 0];
-        Mdl = setTransient(Mdl, S.t, xNow + dx - ssStateVec(Mdl, S.t));
-        pushSegment(Mdl);
-        if ~S.playing, renderFrame(true); end
+        wk = 2 * pi * St.fn(min(2, numel(St.fn)));
+        S.x(5) = S.x(5) + P.theta0 * wk;
+        S.x(6) = S.x(6) - 0.7 * P.theta0 * wk;
+        S.ampEst = max(S.ampEst, 1.5 * P.theta0);
+        if ~S.playing, startPlayback(); end
     end
 
     % -----------------------------------------------------------------
@@ -615,12 +625,17 @@ end
     % -----------------------------------------------------------------
     function setFrequency(f, source)
         if ~isfinite(f), return; end
+        if ~strcmp(source, 'sweep'), stopSweep(); end
         f = round(f * 1000) / 1000;
         f = min(max(f, P.fMin), P.fMax);
         P.f = f;
-        refreshFrequencyWidgets(source);
         S.needRebuild = true;
         S.resDirty = true;
+        if strcmp(source, 'sweep')
+            S.freqWidgetsDirty = true;
+        else
+            refreshFrequencyWidgets(source);
+        end
         if ~S.playing
             processPending();
             renderFrame(true);
@@ -654,6 +669,26 @@ end
         P.fStep = v;
     end
 
+    function startSweep(direction)
+        S.sweepDir = direction;
+        if direction > 0
+            H.sweepUpBtn.BackgroundColor = [0.15 0.45 0.2];
+            H.sweepDnBtn.BackgroundColor = CLR.button;
+        else
+            H.sweepDnBtn.BackgroundColor = [0.15 0.45 0.2];
+            H.sweepUpBtn.BackgroundColor = CLR.button;
+        end
+        if ~S.playing, startPlayback(); end
+    end
+
+    function stopSweep()
+        S.sweepDir = 0;
+        if isfield(H, 'sweepUpBtn') && isvalid(H.sweepUpBtn)
+            H.sweepUpBtn.BackgroundColor = CLR.button;
+            H.sweepDnBtn.BackgroundColor = CLR.button;
+        end
+    end
+
     % -----------------------------------------------------------------
     % Playback
     % -----------------------------------------------------------------
@@ -681,14 +716,68 @@ end
             dtWall = toc(S.lastTic);
             S.lastTic = tic;
             dtWall = min(dtWall, 0.1);          % avoid jumps after GUI stalls
+            dtSim = dtWall * P.speed;
+            if S.sweepDir ~= 0
+                % sweep rate is in semitones per SIMULATED second
+                fNew = P.f * 2^(S.sweepDir * P.sweepRate / 12 * dtSim);
+                if fNew >= P.fMax || fNew <= P.fMin
+                    fNew = min(max(fNew, P.fMin), P.fMax);
+                    stopSweep();
+                end
+                setFrequency(fNew, 'sweep');
+            end
             processPending();
-            S.t = S.t + dtWall * P.speed;
+            advance(dtSim);
+            if S.freqWidgetsDirty && mod(S.frame, 3) == 0
+                refreshFrequencyWidgets('sweep');
+                S.freqWidgetsDirty = false;
+            end
+            S.effSpeed = S.lastSteps * S.lastDt / max(dtWall, eps);
             renderFrame(false);
         catch err
             stopPlayback();
             if isvalid(H.fig)
                 uialert(H.fig, sprintf('Animation stopped: %s', err.message), 'Simulation error');
             end
+        end
+    end
+
+    function advance(dtSim)
+        % Integrate the nonlinear model over the newly elapsed simulated
+        % time only. A step budget keeps the GUI responsive; if it is hit,
+        % simulated time runs slower than requested (reported on screen).
+        dt = stepSize(Mdl, P, S.ampEst);
+        S.simDebt = S.simDebt + dtSim;
+        n = floor(S.simDebt / dt);
+        S.cpuLimited = n > S.stepBudget;
+        if S.cpuLimited
+            n = S.stepBudget;
+            S.simDebt = 0;
+        else
+            S.simDebt = S.simDebt - n * dt;
+        end
+        S.lastSteps = n; S.lastDt = dt;
+        if n < 1, return; end
+        rho = exp(-2 * pi * P.noiseCorner * dt);
+        xi = P.noise * sqrt(1 - rho^2) * randn(S.rng, n, 1);
+        tic0 = tic;
+        [xNew, phNew, anNew, rec] = integrateChunk(S.x, S.phase, S.an, n, dt, Mdl, rho, xi);
+        el = toc(tic0);
+        if ~all(isfinite(xNew)) || ~all(isfinite(rec(:)))
+            % numerical safeguard: restart from the small-signal steady state
+            S.x = ssStatePhase(Mdl, S.phase);
+            S.an = 0;
+            S.nanReset = true;
+            return
+        end
+        tRec = S.t + (1:n) * dt;
+        S.t = tRec(end);
+        S.x = xNew; S.phase = phNew; S.an = anNew;
+        S.ampEst = max(abs(rec(3:4, :)), [], 'all');
+        bufAppend([tRec; rec(2:4, :); tableEval(Mdl.sL, rec(1, :))]);
+        % adapt the step budget to keep integration under ~12 ms per frame
+        if el > 0
+            S.stepBudget = round(min(60000, max(800, 0.7 * S.stepBudget + 0.3 * n * 0.012 / el)));
         end
     end
 
@@ -708,25 +797,64 @@ end
     end
 
     % -----------------------------------------------------------------
+    % Ring buffer of simulated samples (the visible persistence trail)
+    % -----------------------------------------------------------------
+    function bufAppend(D)
+        n = size(D, 2);
+        if n == 0, return; end
+        if n >= S.Nb
+            D = D(:, end - S.Nb + 1:end);
+            n = S.Nb;
+        end
+        idx = mod(S.bufHead + (0:n - 1), S.Nb) + 1;
+        S.buf(:, idx) = D;
+        S.bufHead = idx(end);
+        S.bufCount = min(S.Nb, S.bufCount + n);
+    end
+
+    function D = bufRecent(tFrom)
+        if S.bufCount == 0
+            D = zeros(6, 0);
+            return
+        end
+        idx = mod(S.bufHead - S.bufCount + (0:S.bufCount - 1), S.Nb) + 1;
+        tt = S.buf(1, idx);
+        first = find(tt >= tFrom, 1);
+        if isempty(first)
+            D = S.buf(:, idx(end));
+        else
+            D = S.buf(:, idx(first:end));
+        end
+    end
+
+    function f = fastestContent()
+        % highest frequency present in the motion (drive harmonics or modes)
+        f = max(Mdl.f * Mdl.nmaxF, Mdl.fnMax * sqrt(1 + 3 * P.eta_nl * (S.ampEst / P.theta_ref)^2));
+    end
+
+    % -----------------------------------------------------------------
     % Rendering
     % -----------------------------------------------------------------
     function renderFrame(forceAll)
         if nargin < 1, forceAll = false; end
         tStart = tic;
         S.frame = S.frame + 1;
-        Mdl = S.segs{end};
+        truncated = false;
+        tiltWarn = false;
 
-        % ---- compute the visible trajectory (rolling exposure window) ----
+        % ---- the visible trajectory (rolling exposure window) ----
         if strcmp(P.mode, 'Physics')
-            dt = sampleStep(Mdl, Mdl.f);
-            tv = sampleTimes(S.t, P.exposure, dt, S.NsMax);
-            q = evalSegments(S.segs, S.segStart, tv, false);
-            [X, Y, S.saturated] = qToScreen(q, G, P);
+            D = bufRecent(S.t - P.exposure);
+            [D, truncated] = selectSamples(D, S.NsMax, fastestContent());
+            [X, Y, tiltWarn] = qToScreen(D(2:4, :), G, P);
+            tv = D(1, :);
         else
             [X, Y, tv] = lissajousTrail(S.t, P, S.NsMax);
-            S.saturated = false;
         end
         Ns = numel(X);
+        if Ns == 0
+            X = NaN; Y = NaN; tv = S.t; Ns = 1;
+        end
 
         % ---- update the ONE laser trajectory (existing objects only) ----
         br = P.brightness;
@@ -748,12 +876,10 @@ end
         if isempty(ext) || ~isfinite(ext), ext = 0; end
         if P.autoFit
             target = max(1.35 * ext, 0.01);
-            if target > S.viewHalf || target < 0.45 * S.viewHalf
-                if target > S.viewHalf
-                    S.viewHalf = target;
-                else
-                    S.viewHalf = S.viewHalf + 0.25 * (target - S.viewHalf);
-                end
+            if target > S.viewHalf
+                S.viewHalf = target;
+            elseif target < 0.45 * S.viewHalf
+                S.viewHalf = S.viewHalf + 0.25 * (target - S.viewHalf);
             end
         else
             S.viewHalf = P.viewHalf_cm;
@@ -765,29 +891,44 @@ end
 
         % ---- pattern statistics (comparison with photographs) -----------
         st = patternStats(X, Y);
-        S.lastStats = st;
         [nm, cents] = nearestNote(P.f);
         if strcmp(P.mode, 'Physics')
-            modeStr = 'PHYSICS MODEL';
+            modeStr = 'PHYSICS MODEL (nonlinear, integrated in time)';
         elseif P.Lis.bassTreble
             modeStr = 'HYPOTHETICAL two-frequency (NOT how bass/treble work)';
         else
             modeStr = 'IDEALIZED LISSAJOUS (not the physical system)';
         end
-        H.info.String = sprintf(['%s Hz  (%s %+.0f c)  %s wave\n%s\n' ...
+        sweepStr = '';
+        if S.sweepDir > 0, sweepStr = sprintf('  SWEEP UP %.2g st/s', P.sweepRate); end
+        if S.sweepDir < 0, sweepStr = sprintf('  SWEEP DOWN %.2g st/s', P.sweepRate); end
+        H.info.String = sprintf(['%s Hz  (%s %+.0f c)  %s wave%s\n%s\n' ...
             'pattern %.2f x %.2f cm, major axis %+.0f deg   view %s%.3g cm'], ...
-            formatFreq(P.f), nm, cents, P.wave, modeStr, st.len, st.wid, st.ang, ...
+            formatFreq(P.f), nm, cents, P.wave, sweepStr, modeStr, st.len, st.wid, st.ang, ...
             char(177), S.viewHalf);
-        if S.saturated
-            H.warnTxt.String = 'Tilt > contact limit: mirror would rattle on the spring (tanh limit applied)';
-        elseif Ns >= S.NsMax && strcmp(P.mode, 'Physics')
-            H.warnTxt.String = sprintf('High frequency: last %.3g ms of the exposure drawn (pattern is periodic)', ...
-                1e3 * (tv(end) - tv(1)));
-        else
-            H.warnTxt.String = '';
+        warn = {};
+        if S.cpuLimited && S.playing
+            warn{end + 1} = sprintf('CPU-limited: simulated time running at %.2g%s instead of %.2g%s', ...
+                S.effSpeed, GL.times, P.speed, GL.times);
         end
-        H.timeLbl.Text = sprintf('t_sim = %.6f s   frame %d   samples %d', S.t, S.frame, Ns);
-        H.status.Text = strsplit(statusText(Mdl, st), newline);
+        if truncated && strcmp(P.mode, 'Physics')
+            warn{end + 1} = sprintf('High frequency: last %.3g ms of the exposure drawn (anti-aliased)', ...
+                1e3 * (tv(end) - tv(1)));
+        end
+        if tiltWarn
+            warn{end + 1} = 'Tilt beyond 0.25 rad: outside the small-tilt contact model (mirror would rattle)';
+        end
+        if S.nanReset
+            warn{end + 1} = 'Numerical safeguard: state restarted from steady state';
+            S.nanReset = false;
+        end
+        if ~S.playing && strcmp(P.mode, 'Physics')
+            warn{end + 1} = 'Paused: the trail shows the motion before any change. Press Play.';
+        end
+        H.warnTxt.String = strjoin(warn, newline);
+        H.timeLbl.Text = sprintf('t_sim = %.4f s  steps/frame %d  dt %.3g %ss', ...
+            S.t, S.lastSteps, 1e6 * S.lastDt, GL.mu);
+        H.status.Text = strsplit(statusText(st), newline);
 
         % ---- secondary plots (throttled) ---------------------------------
         if forceAll || mod(S.frame, 3) == 0
@@ -802,40 +943,36 @@ end
         end
         drawnow limitrate;
 
-        % ---- performance safeguard: adapt sample budget ------------------
+        % ---- performance safeguard: adapt drawn-sample budget ----------
         el = toc(tStart);
-        if el > 0.030
+        if el > 0.020
             S.NsMax = max(600, round(S.NsMax * 0.85));
-        elseif el < 0.012
+        elseif el < 0.008
             S.NsMax = min(3000, round(S.NsMax * 1.05) + 1);
         end
     end
 
-    function txt = statusText(Mdl, st)
-        thV = abs(Mdl.Q(2, 1)); thH = abs(Mdl.Q(3, 1));
-        dphi = angle(Mdl.Q(2, 1) / (Mdl.Q(3, 1) + eps)) * 180 / pi;
-        txt = sprintf([' Fundamental: |%s_x| = %.3g mrad, |%s_y| = %.3g mrad, phase(%s_y - %s_x) = %+.0f%s' ...
-            '   |z| = %.3g %sm\n Trail: %.2f x %.2f cm  (axis ratio %.2f)   harmonics used: %d   transient: %s'], ...
-            GL.theta, 1e3 * thH, GL.theta, 1e3 * thV, GL.theta, GL.theta, dphi, GL.deg, ...
-            1e6 * abs(Mdl.Q(1, 1)), GL.mu, st.len, st.wid, st.wid / max(st.len, eps), ...
-            numel(Mdl.n), onOff(transientAlive(Mdl, S.t)));
+    function txt = statusText(st)
+        Q1 = Mdl.QF(:, 1);
+        dphi = angle(Q1(2) / (Q1(3) + eps)) * 180 / pi;
+        txt = sprintf([' Small-signal fundamental: |%s_x| = %.3g mrad, |%s_y| = %.3g mrad, phase(%s_y - %s_x) = %+.0f%s' ...
+            '\n Trail: %.2f x %.2f cm (axis ratio %.2f)   max tilt %.3g mrad   harmonics in drive: %d'], ...
+            GL.theta, 1e3 * abs(Q1(3)), GL.theta, 1e3 * abs(Q1(2)), GL.theta, GL.theta, dphi, GL.deg, ...
+            st.len, st.wid, st.wid / max(st.len, eps), 1e3 * S.ampEst, numel(Mdl.nF));
     end
 
     function updateSignalPlots()
-        Mdl = S.segs{end};
-        dt = sampleStep(Mdl, Mdl.f);
-        Wp = min(3 / Mdl.f, 0.5);
-        Ns = min(2000, max(50, ceil(Wp / dt) + 1));
-        tv = S.t - (Ns - 1:-1:0) * dt;
-        [q, sp] = evalSegments(S.segs, S.segStart, tv, true);
-        tm = (tv - S.t) * 1e3;
-        set(H.lSpkOut, 'XData', tm, 'YData', sp(1, :) * 1e6);
-        set(H.lSpkIn,  'XData', tm, 'YData', sp(2, :) * 1e6);
-        set(H.lSpr,    'XData', tm, 'YData', q(1, :) * 1e6);
-        set(H.lThX,    'XData', tm, 'YData', q(3, :) * 1e3);
-        set(H.lThY,    'XData', tm, 'YData', q(2, :) * 1e3);
-        xl = [tm(1) 0];
-        if xl(2) <= xl(1), xl(1) = xl(2) - 1e-6; end
+        Wp = min(max(3 / P.f, 0.02), 0.5);
+        D = bufRecent(S.t - Wp);
+        D = selectSamples(D, 2000, fastestContent());
+        if size(D, 2) < 2, return; end
+        tm = (D(1, :) - S.t) * 1e3;
+        set(H.lSpkOut, 'XData', tm, 'YData', D(5, :) * 1e6);
+        set(H.lSpkIn,  'XData', tm, 'YData', D(6, :) * 1e6);
+        set(H.lSpr,    'XData', tm, 'YData', D(2, :) * 1e6);
+        set(H.lThX,    'XData', tm, 'YData', D(4, :) * 1e3);
+        set(H.lThY,    'XData', tm, 'YData', D(3, :) * 1e3);
+        xl = [tm(1) max(tm(end), tm(1) + 1e-6)];
         H.axSpk.XLim = xl; H.axSpr.XLim = xl; H.axTilt.XLim = xl;
     end
 
@@ -862,26 +999,26 @@ end
         set(H.lResModes, 'XData', xs, 'YData', ys);
         set(H.lResNow, 'XData', [P.f P.f], 'YData', [yBot yTop]);
         H.axRes.YLim = [yBot yTop];
-        [~, ix] = max(thx + thy);
-        H.resNote.Text = sprintf([' Coupled natural frequencies: %s Hz  (undamped)   |   1-DOF reference ' ...
-            'f_n = sqrt(k_eff/m)/2%s = %.1f Hz   |   largest tilt response at %.1f Hz. ' ...
-            'Above the speaker resonances the cone acceleration is roughly constant, so the mirror ' ...
-            'response falls as 1/f^2 above its own modes.'], ...
-            strjoin(arrayfun(@(x) sprintf('%.1f', x), St.fn(:)', 'UniformOutput', false), ', '), ...
-            GL.pi, St.fn1, fs(ix));
+        fmL = sprintf('%.1f, ', St.fn); fmL = fmL(1:end - 2);
+        fr = St.fn(:)';
+        sub = sprintf('%.0f, ', sort([fr / 2, fr / 3])); sub = sub(1:end - 2);
+        H.resNote.Text = sprintf([' Coupled natural frequencies: %s Hz (undamped). Lines and ellipses ' ...
+            'turn as f passes each mode. With harmonic distortion, multi-lobe figures appear near f_n/2 ' ...
+            'and f_n/3 = %s Hz. Contact hardening bends the peaks to the right at large amplitude, so ' ...
+            'up- and down-sweeps can jump at different frequencies.'], fmL, sub);
     end
 
     function updateReadouts()
         if ~isfield(H, 'eqInfo'), return; end
-        Mdl = S.segs{end};
         Heq = eqResponse(P.f, P);
         H.eqInfo.Text = sprintf('EQ gain at %s Hz: %+.2f dB   (linear volume %.2f)', ...
             formatFreq(P.f), 20 * log10(abs(Heq)), P.volume / 100);
         H.spkInfo.Text = sprintf('At f: |s_out| = %.3g %sm, |s_in| = %.3g %sm (fundamental)', ...
-            1e6 * abs(Mdl.So(1)), GL.mu, 1e6 * abs(Mdl.Si(1)), GL.mu);
+            1e6 * abs(Mdl.So1), GL.mu, 1e6 * abs(Mdl.Si1), GL.mu);
         H.fnInfo1.Text = sprintf('1-DOF f_n = %.1f Hz (k_eff = %.0f N/m, m = %.2f g)', ...
             St.fn1, St.keff1, P.m * 1e3);
-        H.fnInfo2.Text = sprintf('Coupled modes: %.1f, %.1f, %.1f Hz', St.fn(1), St.fn(2), St.fn(3));
+        H.fnInfo2.Text = sprintf('Coupled modes: %.1f, %.1f, %.1f Hz (tilt pair split %.0f%%)', ...
+            St.fn(1), St.fn(2), St.fn(3), 100 * (St.fn(3) / St.fn(2) - 1));
         [dmin, im] = min(abs(P.f - St.fn) ./ St.fn);
         if dmin < 2 * P.zeta
             H.resLamp.Color = [1 0.2 0.2];
@@ -979,12 +1116,12 @@ end
         if ~isfield(H, 's3Mirror') || ~isvalid(H.s3Mirror), return; end
         exag = H.exagDrop.Value;
         if strcmp(P.mode, 'Physics')
-            q = evalSegments(S.segs, S.segStart, S.t, false);
+            q = S.x(1:3);
         else
             q = zeros(3, 1);
         end
-        thV = P.theta_lim * tanh(q(2) / P.theta_lim) * exag;
-        thH = P.theta_lim * tanh(q(3) / P.theta_lim) * exag;
+        thV = min(max(q(2), -P.tiltMax), P.tiltMax) * exag;
+        thH = min(max(q(3), -P.tiltMax), P.tiltMax) * exag;
         [~, ~, valid, hit, dout, n, Pscr] = laserSpot(G, q(1), thV, thH);
         % mirror disc with the current (optionally exaggerated) normal
         [e1, e2] = planeBasis(n);
@@ -1023,7 +1160,7 @@ end
         printVerification(R);
         if isempty(S.verifyFig) || ~isvalid(S.verifyFig)
             S.verifyFig = uifigure('Name', 'Numerical verification report', ...
-                'Position', [120 120 1180 520], 'Color', CLR.bg);
+                'Position', [120 120 1180 560], 'Color', CLR.bg);
             g = uigridlayout(S.verifyFig, [2 1]);
             g.RowHeight = {40, '1x'}; g.BackgroundColor = CLR.bg;
             H.vSummary = uilabel(g, 'Text', '', 'FontColor', CLR.text, 'FontSize', 14, 'FontWeight', 'bold');
@@ -1064,7 +1201,7 @@ P.wave = 'Sine';
 P.fStep = 1;               % Hz per arrow-button press
 P.fMin = 1; P.fMax = 20154;
 P.audioBandwidth = 22050;  % Hz: harmonics above this are not generated (44.1 kHz audio)
-P.nHarmMax = 300;          % max number of Fourier harmonics considered
+P.nHarmMax = 512;          % max Fourier harmonics (reaches the mirror modes even for a 1 Hz square wave)
 % ---- amplifier ----
 P.volume = 50;             % % (linear amplitude taper - assumption)
 P.bass_dB = 0; P.treble_dB = 0;
@@ -1082,21 +1219,26 @@ P.r_tape = 0.05;           % m, radial distance tweeter axis -> tape
 P.r_tweeter = 0.02;        % m, tweeter radiating radius
 P.d_tweeter = 0.035;       % m, tweeter centre -> mirror distance
 P.rho_air = 1.2;           % kg/m^3
+P.c_air = 343;             % m/s
+P.hd2 = 0.02;              % 2nd-harmonic distortion of cone motion (fraction) [estimate]
+P.hd3 = 0.01;              % 3rd-harmonic distortion of cone motion (fraction) [estimate]
 % ---- tape, spring, mirror ----
 P.L = 0.0254;              % m, spring length (1 inch)
 P.k = 400;                 % N/m, spring tip bending stiffness 3EI/L^3 [estimate]
-P.beta_t = 0.3;            % torsional/bending rotational stiffness ratio [estimate]
+P.beta_t = 1.15;           % torsion/bending stiffness ratio; helical-spring theory gives 1 + nu/2
 P.m = 0.5e-3;              % kg, mirror + adhesive mass [estimate]
 P.R_mirror = 6e-3;         % m, mirror radius
-P.zeta = 0.05;             % modal damping ratio of the spring-mirror system [estimate]
-P.C_tape = 0.5e-3;         % m/N, series compliance of tape + mirror/spring contact
-P.w_tape = 10e-3;          % m, lever arm converting tape compliance to rotation
-P.e_h = 3e-3;              % m, lateral offset of mirror CoM from spring tip (horizontal tilt)
-P.e_v = 6e-3;              % m, height of mirror CoM above spring axis (vertical tilt)
+P.zeta = 0.01;             % modal damping ratio of the spring-mirror system [estimate]
+P.C_tape = 3e-3;           % m/N, series compliance of tape + mirror/spring contact [estimate]
+P.w_tape = 10e-3;          % m, lever arm converting contact compliance to rocking
+P.e_h = 2e-3;              % m, lateral offset of mirror CoM from spring tip (horizontal tilt)
+P.e_v = 2e-3;              % m, height of mirror CoM above spring axis (vertical tilt)
 P.kappa_c = 0.2;           % cross-axis stiffness coupling (cone slant / helix)
 P.cp_shift = 0.3;          % centre-of-pressure shift toward tweeter (x mirror radius)
-P.theta0 = 5e-3;           % rad, initial angular perturbation at reset / kick
-P.theta_lim = 0.15;        % rad, contact limit (mirror would lift / rattle)
+P.eta_nl = 0.02;           % contact hardening: fractional rocking-stiffness rise at theta_ref [estimate]
+P.theta_ref = 0.01;        % rad, reference tilt for eta_nl
+P.theta0 = 5e-3;           % rad, kick size (angular velocity impulse = theta0 * omega_2)
+P.tiltMax = 0.3;           % rad, optics clamp (outside the small-tilt contact model)
 % ---- optics ----
 P.D = 2.5;                 % m, mirror -> screen distance
 P.brightness = 0.9;
@@ -1104,9 +1246,11 @@ P.spot = 3;                % px line width
 P.viewHalf_cm = 10;        % cm, manual view half-width (projection scale)
 P.autoFit = true;
 P.exposure = 0.040;        % s, simulated exposure / visual persistence
-P.noise = 0.05;            % m/s^2 RMS narrow-band base vibration (room, table)
+P.noise = 0.01;            % m/s^2 RMS random base vibration (room, table)
+P.noiseCorner = 300;       % Hz, corner of the first-order (Ornstein-Uhlenbeck) noise spectrum
 % ---- playback ----
-P.speed = 0.01;            % simulated seconds per wall-clock second (slow motion)
+P.speed = 1;               % simulated seconds per wall-clock second (1 = real time, like the eye sees it)
+P.sweepRate = 1;           % semitones per simulated second
 P.mode = 'Physics';
 P.show3D = true;
 % ---- idealized Lissajous ----
@@ -1147,6 +1291,7 @@ Phi = Phi ./ sqrt(diag(Phi.' * Mm * Phi)).';     % mass-normalise
 wn = sqrt(max(w2, 0));
 
 St.M = Mm; St.K = K; St.Ks = Ks;
+St.Minv = Mm \ eye(3);
 St.Phi = Phi; St.wn = wn; St.fn = wn / (2 * pi);
 St.zeta = P.zeta;
 St.C = Mm * Phi * diag(2 * P.zeta * wn) * Phi.' * Mm;   % modal (proportional) damping
@@ -1155,23 +1300,9 @@ St.r_psi = [L; 0; 1];                      % influence of local cone rocking abo
 St.r_p = [1; -P.e_v; P.e_h + P.cp_shift * P.R_mirror];  % acoustic force point
 St.keff1 = 1 / (1 / k + P.C_tape);         % 1-DOF reference stiffness
 St.fn1 = sqrt(St.keff1 / m) / (2 * pi);    % f_n = (1/2pi) sqrt(k/m)
-end
-
-function [Q, So, Si, F] = harmonicResponse(St, P, f, U)
-% Steady-state complex amplitudes for drive phasors U at frequencies f.
-w = 2 * pi * f;
-Ho = speakerFRF(f, P.fs_out, P.zeta_spk);
-Hi = speakerFRF(f, P.fs_in, P.zeta_spk);
-So = P.A_out * Ho .* U;                                   % woofer cone displacement (m)
-Si = P.A_in * Hi .* U * exp(1i * P.phi_rel_deg * pi / 180); % tweeter cone displacement (m)
-aOut = -w.^2 .* So;                                       % cone acceleration
-aIn  = -w.^2 .* Si;
-psiAcc = P.kappa * aIn / P.r_tape;                        % local rocking acceleration (rad/s^2)
-pAc = P.rho_air * pi * P.r_tweeter^2 * aIn / (2 * pi * P.d_tweeter);   % near-field pressure (Pa)
-Fac = pi * P.R_mirror^2 * pAc;                            % force on mirror face (N)
-F = -(St.M * St.r_y) * aOut - (St.M * St.r_psi) * psiAcc - St.r_p * Fac;
-den = St.wn.^2 - w.^2 + 2i * St.zeta * St.wn .* w;        % modal receptance denominators
-Q = St.Phi * ((St.Phi.' * F) ./ den);
+% isotropic contact hardening: tau = -k3 |theta|^2 theta, k3 = eta*k_rock/theta_ref^2
+St.kRock = 0.5 * (K(2, 2) + K(3, 3));
+St.k3 = P.eta_nl * St.kRock / P.theta_ref^2;
 end
 
 function H = speakerFRF(f, fs, zeta)
@@ -1186,6 +1317,32 @@ GL = 10^(P.bass_dB / 20); GH = 10^(P.treble_dB / 20);
 wL = 2 * pi * P.fBass; wH = 2 * pi * P.fTreble;
 H = (s + wL * sqrt(GL)) ./ (s + wL / sqrt(GL)) .* ...
     GH .* (s + wH / sqrt(GH)) ./ (s + wH * sqrt(GH));
+end
+
+function F = forceFromCone(St, P, fk, So, Si)
+% Generalised force phasors on q from cone-displacement phasors So, Si.
+w = 2 * pi * fk;
+aOut = -w.^2 .* So;                                       % woofer acceleration at the tape
+aIn  = -w.^2 .* Si;                                       % tweeter acceleration
+psiAcc = P.kappa * aIn / P.r_tape;                        % local rocking acceleration (rad/s^2)
+pAc = P.rho_air * pi * P.r_tweeter^2 * aIn / (2 * pi * P.d_tweeter) ...
+    .* exp(-1i * w * P.d_tweeter / P.c_air);              % near-field pressure with travel delay (Pa)
+Fac = pi * P.R_mirror^2 * pAc;                            % force on mirror face (N)
+F = -(St.M * St.r_y) * aOut - (St.M * St.r_psi) * psiAcc - St.r_p * Fac;
+end
+
+function Q = modalSolve(St, F, fk)
+w = 2 * pi * fk;
+den = St.wn.^2 - w.^2 + 2i * St.zeta * St.wn .* w;        % modal receptance denominators
+Q = St.Phi * ((St.Phi.' * F) ./ den);
+end
+
+function [Q, So, Si, F] = harmonicResponse(St, P, f, U)
+% Linear steady-state complex amplitudes for drive phasors U at frequencies f.
+So = P.A_out * speakerFRF(f, P.fs_out, P.zeta_spk) .* U;
+Si = P.A_in * speakerFRF(f, P.fs_in, P.zeta_spk) .* U * exp(1i * P.phi_rel_deg * pi / 180);
+F = forceFromCone(St, P, f, So, Si);
+Q = modalSolve(St, F, f);
 end
 
 function [n, b] = waveformHarmonics(wave, f, fBW, nMax)
@@ -1210,54 +1367,163 @@ keep = b ~= 0;
 n = n(keep); b = b(keep);
 end
 
-function Mdl = buildModel(P, St, seed)
-% Build one parameter segment: steady state (per harmonic + one-period
-% lookup table), modal data for the transient and the disturbance.
+function [n, So, Si] = addDistortion(n, So, Si, h2, h3)
+% Weak cone nonlinearity: a quadratic / cubic term acting on the
+% fundamental cone motion S1 adds h2*S1^2/|S1| at 2f and h3*S1^3/|S1|^2
+% at 3f (magnitudes h*|S1|, phases 2 and 3 times the fundamental phase).
+i1 = find(n == 1, 1);
+if isempty(i1), return; end
+orders = [2 3]; hs = [h2 h3];
+S1o = So(i1); S1i = Si(i1);
+for j = 1:2
+    if hs(j) == 0, continue; end
+    o = orders(j);
+    idx = find(n == o, 1);
+    if isempty(idx)
+        n(end + 1) = o; So(end + 1) = 0; Si(end + 1) = 0; %#ok<AGROW>
+        idx = numel(n);
+    end
+    So(idx) = So(idx) + hs(j) * S1o^o / max(abs(S1o), realmin)^(o - 1);
+    Si(idx) = Si(idx) + hs(j) * S1i^o / max(abs(S1i), realmin)^(o - 1);
+end
+end
+
+function Mdl = buildModel(P, St)
+% Excitation tables for the current tone and the integrator matrices.
 [n, b] = waveformHarmonics(P.wave, P.f, P.audioBandwidth, P.nHarmMax);
 fk = n * P.f;
 U = (P.volume / 100) * eqResponse(fk, P) .* (-1i * b);     % Re(-i b e^{iwt}) = b sin(wt)
-[Q, So, Si, F] = harmonicResponse(St, P, fk, U);
-% prune harmonics that are negligible both mechanically and acoustically
+So = P.A_out * speakerFRF(fk, P.fs_out, P.zeta_spk) .* U;
+Si = P.A_in * speakerFRF(fk, P.fs_in, P.zeta_spk) .* U * exp(1i * P.phi_rel_deg * pi / 180);
+[n, So, Si] = addDistortion(n, So, Si, P.hd2, P.hd3);
+fk = n * P.f;
+F = forceFromCone(St, P, fk, So, Si);
+Q = modalSolve(St, F, fk);
+% keep harmonics that matter mechanically (drive table) or visibly (speaker plot)
 qm = max(abs(Q), [], 1); sm = max(abs([So; Si]), [], 1);
-keep = (qm >= 1e-5 * max(qm)) | (sm >= 1e-5 * max(sm));
-if max(qm) == 0 && max(sm) == 0, keep = false(size(n)); end
-keep(1) = true;
-n = n(keep); fk = fk(keep); b = b(keep); U = U(keep);
-Q = Q(:, keep); So = So(keep); Si = Si(keep); F = F(:, keep);
-
-Np = min(4096, max(256, 16 * max(n)));
-ph = (0:Np - 1) / Np;
-E = exp(2i * pi * n(:) * ph);              % Nh x Np
-Mdl.f = P.f; Mdl.n = n; Mdl.fk = fk; Mdl.b = b; Mdl.U = U;
-Mdl.Q = Q; Mdl.So = So; Mdl.Si = Si; Mdl.F = F;
+if max(qm) > 0, keepF = qm >= 1e-4 * max(qm); else, keepF = false(size(n)); end
+if max(sm) > 0, keepS = sm >= 1e-3 * max(sm); else, keepS = false(size(n)); end
+keepF(n == 1) = true; keepS(n == 1) = true;
+nmax = max(n(keepF | keepS));
+Np = min(8192, max(512, 32 * nmax));
+keepF = keepF & n <= Np / 16; keepS = keepS & n <= Np / 16;   % table resolves >= 16 pts/period
+Mdl.f = P.f;
+Mdl.nF = n(keepF); Mdl.fkF = fk(keepF); Mdl.QF = Q(:, keepF); Mdl.FF = F(:, keepF);
+Mdl.nS = n(keepS); Mdl.SoS = So(keepS); Mdl.SiS = Si(keepS);
+Mdl.So1 = So(n == 1); Mdl.Si1 = Si(n == 1);
+Mdl.nmaxF = max(Mdl.nF);
 Mdl.Np = Np;
-Mdl.qL = real(Q * E);                      % 3 x Np one-period table
-Mdl.sL = real([So; Si] * E);               % 2 x Np speaker displacements
-Mdl.M = St.M; Mdl.K = St.K; Mdl.C = St.C;
+Mdl.Ft = St.Minv * periodicTable(Mdl.FF, Mdl.nF, Np);   % 3 x Np acceleration-forcing table (one period)
+Mdl.qL = periodicTable(Mdl.QF, Mdl.nF, Np);              % 3 x Np small-signal steady state (linear)
+Mdl.sL = periodicTable([Mdl.SoS; Mdl.SiS], Mdl.nS, Np);  % 2 x Np speaker displacements
+Mdl.A = St.Minv * St.K;
+Mdl.B = St.Minv * St.C;
+Mdl.k3 = St.k3;
+Mdl.mi2 = St.Minv(:, 2); Mdl.mi3 = St.Minv(:, 3);
+Mdl.fnMax = max(St.fn);
+Mdl.M = St.M; Mdl.K = St.K; Mdl.C = St.C; Mdl.Minv = St.Minv;
 Mdl.Phi = St.Phi; Mdl.wn = St.wn; Mdl.zeta = St.zeta;
 Mdl.tr = struct('active', false, 't0', 0, 'eta0', zeros(3, 1), 'etad0', zeros(3, 1));
-% narrow-band random base vibration: sinusoids clustered around each mode
-Nn = numel(seed.u);
-modeIdx = mod(0:Nn - 1, 3) + 1;
-wj = St.wn(modeIdx) .* (1 + 1.5 * St.zeta * seed.u(:));
-wj = max(wj, 2 * pi * 0.5);
-aj = P.noise * sqrt(2 / Nn) * ones(1, Nn);
-Fj = -(St.M * St.r_y) * aj;
-den = St.wn.^2 - (wj.').^2 + 2i * St.zeta * St.wn .* (wj.');
-Mdl.noiseQ = St.Phi * ((St.Phi.' * Fj) ./ den);
-Mdl.noiseW = wj(:);
-Mdl.noisePh = seed.ph(:);
-Mdl.noiseOn = P.noise > 0;
 end
 
-function seed = makeNoiseSeed(N)
-rs = RandStream('mt19937ar', 'Seed', 2026);
-seed.u = randn(rs, N, 1);
-seed.ph = 2 * pi * rand(rs, N, 1);
+function tab = periodicTable(C, n, Np)
+% One period of real(sum_j C(:,j) exp(2i*pi*n(j)*k/Np)), k = 0..Np-1, by inverse FFT.
+spec = zeros(size(C, 1), Np);
+spec(:, n + 1) = C;
+tab = real(ifft(spec, [], 2)) * Np;
+end
+
+function v = tableEval(tab, ph)
+% Periodic linear interpolation of a one-period table at phases ph (cycles).
+Np = size(tab, 2);
+p = mod(ph, 1) * Np;
+i0 = floor(p); fr = p - i0;
+i0 = mod(i0, Np) + 1;
+i1 = mod(i0, Np) + 1;
+v = tab(:, i0) .* (1 - fr) + tab(:, i1) .* fr;
+end
+
+function dt = stepSize(Mdl, P, amp)
+% RK4 step resolving the drive (48 pts/period), its highest retained
+% harmonic (16 pts/period) and the fastest mode (30 pts/period). The
+% hardening contact stiffens with amplitude, so the mode limit rises too.
+fFast = Mdl.fnMax * sqrt(1 + 3 * P.eta_nl * (amp / P.theta_ref)^2);
+dt = min([1 / (48 * Mdl.f), 1 / (16 * Mdl.f * Mdl.nmaxF), 1 / (30 * fFast)]);
+end
+
+function [x, ph, an, rec] = integrateChunk(x, ph, an, nSteps, dt, Mdl, rho, xi)
+% Fixed-step RK4 of  q'' = Minv*F(phase) - a_n*r_y - A q - B q' - Minv*f_nl(q)
+% written with scalars for speed. The tone phase (cycles) advances by f*dt
+% per step, so changing f between chunks never makes the drive jump.
+% a_n is a first-order (Ornstein-Uhlenbeck) random base acceleration, held
+% constant over each step. rec = [phase; z; theta_v; theta_h] after each step.
+Ft = Mdl.Ft; Np = size(Ft, 2);
+A = Mdl.A; B = Mdl.B;
+a11 = A(1, 1); a12 = A(1, 2); a13 = A(1, 3);
+a21 = A(2, 1); a22 = A(2, 2); a23 = A(2, 3);
+a31 = A(3, 1); a32 = A(3, 2); a33 = A(3, 3);
+b11 = B(1, 1); b12 = B(1, 2); b13 = B(1, 3);
+b21 = B(2, 1); b22 = B(2, 2); b23 = B(2, 3);
+b31 = B(3, 1); b32 = B(3, 2); b33 = B(3, 3);
+m12 = Mdl.mi2(1); m22 = Mdl.mi2(2); m32 = Mdl.mi2(3);
+m13 = Mdl.mi3(1); m23 = Mdl.mi3(2); m33 = Mdl.mi3(3);
+k3 = Mdl.k3;
+dph = Mdl.f * dt;
+q1 = x(1); q2 = x(2); q3 = x(3); v1 = x(4); v2 = x(5); v3 = x(6);
+cst = [0 0.5 0.5 1];
+wst = [1 2 2 1];
+rec = zeros(4, nSteps);
+for kStep = 1:nSteps
+    an = rho * an + xi(kStep);
+    pq1 = 0; pq2 = 0; pq3 = 0; pv1 = 0; pv2 = 0; pv3 = 0;
+    sq1 = 0; sq2 = 0; sq3 = 0; sv1 = 0; sv2 = 0; sv3 = 0;
+    for s = 1:4
+        h = cst(s) * dt;
+        y1 = q1 + h * pq1; y2 = q2 + h * pq2; y3 = q3 + h * pq3;
+        u1 = v1 + h * pv1; u2 = v2 + h * pv2; u3 = v3 + h * pv3;
+        p = ph + cst(s) * dph;
+        p = (p - floor(p)) * Np;
+        i0 = floor(p); fr = p - i0; i0 = i0 + 1;
+        if i0 > Np, i0 = 1; end
+        i1 = i0 + 1;
+        if i1 > Np, i1 = 1; end
+        f1 = Ft(1, i0) + fr * (Ft(1, i1) - Ft(1, i0));
+        f2 = Ft(2, i0) + fr * (Ft(2, i1) - Ft(2, i0));
+        f3 = Ft(3, i0) + fr * (Ft(3, i1) - Ft(3, i0));
+        g = k3 * (y2 * y2 + y3 * y3);
+        n2 = g * y2; n3 = g * y3;
+        c1 = f1 - an - (a11 * y1 + a12 * y2 + a13 * y3) - (b11 * u1 + b12 * u2 + b13 * u3) - (m12 * n2 + m13 * n3);
+        c2 = f2 - (a21 * y1 + a22 * y2 + a23 * y3) - (b21 * u1 + b22 * u2 + b23 * u3) - (m22 * n2 + m23 * n3);
+        c3 = f3 - (a31 * y1 + a32 * y2 + a33 * y3) - (b31 * u1 + b32 * u2 + b33 * u3) - (m32 * n2 + m33 * n3);
+        pq1 = u1; pq2 = u2; pq3 = u3;
+        pv1 = c1; pv2 = c2; pv3 = c3;
+        w = wst(s);
+        sq1 = sq1 + w * u1; sq2 = sq2 + w * u2; sq3 = sq3 + w * u3;
+        sv1 = sv1 + w * c1; sv2 = sv2 + w * c2; sv3 = sv3 + w * c3;
+    end
+    q1 = q1 + dt / 6 * sq1; q2 = q2 + dt / 6 * sq2; q3 = q3 + dt / 6 * sq3;
+    v1 = v1 + dt / 6 * sv1; v2 = v2 + dt / 6 * sv2; v3 = v3 + dt / 6 * sv3;
+    ph = ph + dph;
+    ph = ph - floor(ph);
+    rec(1, kStep) = ph; rec(2, kStep) = q1; rec(3, kStep) = q2; rec(4, kStep) = q3;
+end
+x = [q1; q2; q3; v1; v2; v3];
+end
+
+function x = ssStatePhase(Mdl, ph)
+% Exact small-signal (linear) steady state [q; qdot] at tone phase ph.
+E = exp(2i * pi * Mdl.nF(:) * ph);
+q = real(Mdl.QF * E);
+qd = real((Mdl.QF .* (2i * pi * Mdl.fkF)) * E);
+x = [q; qd];
+end
+
+function x = ssStateVec(Mdl, t)
+x = ssStatePhase(Mdl, mod(Mdl.f * t, 1));
 end
 
 function Mdl = setTransient(Mdl, t0, x0)
-% Free response that makes the total state equal x0 = [q; qdot] at t0.
+% Linear free response that makes the total state equal x0 = [q; qdot] at t0.
 Mdl.tr.t0 = t0;
 Mdl.tr.eta0 = Mdl.Phi.' * Mdl.M * x0(1:3);
 Mdl.tr.etad0 = Mdl.Phi.' * Mdl.M * x0(4:6);
@@ -1279,19 +1545,8 @@ if nargout > 1
 end
 end
 
-function tf = transientAlive(Mdl, t)
-tf = Mdl.tr.active && exp(-Mdl.zeta * min(Mdl.wn) * max(t - Mdl.tr.t0, 0)) > 1e-6;
-end
-
-function x = ssStateVec(Mdl, t)
-% Exact steady-state state vector [q; qdot] at time t.
-E = exp(2i * pi * Mdl.n(:) * mod(Mdl.f * t, 1));
-q = real(Mdl.Q * E);
-qd = real((Mdl.Q .* (2i * pi * Mdl.fk)) * E);
-x = [q; qd];
-end
-
 function x = segmentState(Mdl, t)
+% Exact linear solution: steady state + modal transient.
 x = ssStateVec(Mdl, t);
 if Mdl.tr.active
     [q, qd] = transientModal(Mdl, t - Mdl.tr.t0);
@@ -1299,57 +1554,36 @@ if Mdl.tr.active
 end
 end
 
-function [q, sp] = evalSegments(segs, segStart, t, wantSpk)
-% Mirror coordinates at sample times t using the segment active at each t.
-q = zeros(3, numel(t));
-sp = zeros(2, numel(t));
-idx = sum(segStart(:) <= t, 1);
-idx(idx < 1) = 1;
-for kk = unique(idx)
-    mask = idx == kk;
-    Mdl = segs{kk};
-    tk = t(mask);
-    ph = mod(Mdl.f * tk, 1) * Mdl.Np;
-    i0 = floor(ph); fr = ph - i0;
-    i0 = mod(i0, Mdl.Np) + 1;
-    i1 = mod(i0, Mdl.Np) + 1;
-    qk = Mdl.qL(:, i0) .* (1 - fr) + Mdl.qL(:, i1) .* fr;
-    if Mdl.tr.active && transientAlive(Mdl, min(tk))
-        qk = qk + transientModal(Mdl, tk - Mdl.tr.t0);
-    end
-    if Mdl.noiseOn
-        qk = qk + real(Mdl.noiseQ * exp(1i * (Mdl.noiseW * tk + Mdl.noisePh)));
-    end
-    q(:, mask) = qk;
-    if wantSpk
-        sp(:, mask) = Mdl.sL(:, i0) .* (1 - fr) + Mdl.sL(:, i1) .* fr;
-    end
-end
-end
-
-function dt = sampleStep(Mdl, f)
-% Time step that resolves the drive (64 pts/period), its highest retained
-% harmonic (12 pts/period) and the mirror modes (24 pts/period).
-dt = min(1 / (64 * f), 1 / (12 * Mdl.fk(end)));
-if Mdl.noiseOn || Mdl.tr.active
-    dt = min(dt, 1 / (24 * max(Mdl.wn) / (2 * pi)));
+function [D, truncated] = selectSamples(D, NsMax, fFast)
+% Reduce a chronological sample block to at most NsMax columns without
+% aliasing: decimate only while >= 12 samples per period of the fastest
+% content remain; otherwise keep just the most recent NsMax samples.
+truncated = false;
+n = size(D, 2);
+if n <= NsMax, return; end
+dtr = (D(1, end) - D(1, 1)) / (n - 1);
+spp = 1 / max(dtr * fFast, eps);
+d = min(max(1, floor(spp / 12)), ceil(n / NsMax));
+D = D(:, n:-d:1);
+D = D(:, end:-1:1);
+if size(D, 2) > NsMax
+    D = D(:, end - NsMax + 1:end);
+    truncated = true;
 end
 end
 
 function tv = sampleTimes(tNow, W, dt, NsMax)
-% Rolling exposure window ending at tNow. If the window would need more
-% than NsMax samples, only the most recent NsMax*dt seconds are drawn
-% (the periodic pattern looks identical; anti-aliasing is preserved).
+% Rolling window ending at tNow (used by the idealized Lissajous view).
 Ns = floor(W / dt) + 1;
 Ns = max(2, min(Ns, NsMax));
 tv = tNow - (Ns - 1:-1:0) * dt;
 end
 
-function [X, Y, saturated] = qToScreen(q, G, P)
+function [X, Y, tiltWarn] = qToScreen(q, G, P)
 thV = q(2, :); thH = q(3, :);
-saturated = any(abs([thV thH]) > 0.6 * P.theta_lim);
-thV = P.theta_lim * tanh(thV / P.theta_lim);       % simplified contact limit
-thH = P.theta_lim * tanh(thH / P.theta_lim);
+tiltWarn = any(abs([thV thH]) > 0.25);
+thV = min(max(thV, -P.tiltMax), P.tiltMax);        % optics clamp only
+thH = min(max(thH, -P.tiltMax), P.tiltMax);
 [X, Y] = laserSpot(G, q(1, :), thV, thH);
 X = 100 * X; Y = 100 * Y;                          % m -> cm
 end
@@ -1476,10 +1710,6 @@ function s = formatFreq(f)
 s = regexprep(sprintf('%.3f', f), '\.?0+$', '');
 end
 
-function s = onOff(tf)
-if tf, s = 'decaying'; else, s = 'negligible'; end
-end
-
 function s = passFail(tf)
 if tf, s = 'PASS'; else, s = 'FAIL'; end
 end
@@ -1499,6 +1729,7 @@ end
 function g = greekChars()
 g.theta = char(952); g.zeta = char(950); g.kappa = char(954); g.delta = char(948);
 g.phi = char(966); g.mu = char(181); g.deg = char(176); g.times = char(215); g.pi = char(960);
+g.beta = char(946); g.eta = char(951);
 end
 
 % =====================================================================
@@ -1628,58 +1859,74 @@ R(end + 1) = mkres(9, 'Rational frequency ratios give closed Lissajous curves', 
     sprintf('ratios 3:2, 5:4, 1:3, 2:1 return to the start after T = 1/gcd(a,b): max error %.1e; sqrt2:1 closest return over 50 periods %.2e (not closed)', ...
     eClose, irr));
 
-% 10. full frequency range --------------------------------------------
+% 10. full frequency range (nonlinear integrator, all waveforms) -------
 fList = unique([1, 1.5, logspace(0, log10(P.fMax), 30), 440, P.fMax]);
 waves = {'Sine', 'Square', 'Triangle', 'Sawtooth'};
-nBad = 0; nTot = 0; maxTh = 0; maxNs = 0; seed = makeNoiseSeed(12);
-Pn = P; Pn.noise = 0.2;
+nBad = 0; nTot = 0; maxTh = 0; maxNp = 0; minDt = inf;
+Pn = P; Pn.noise = 0.05;
 Sn = buildStructure(Pn); Gn = buildGeometry(Pn);
+rsn = RandStream('mt19937ar', 'Seed', 7);
 for iw = 1:numel(waves)
     for f = fList
         Pn.f = f; Pn.wave = waves{iw};
-        M = buildModel(Pn, Sn, seed);
-        M = setTransient(M, 0, -ssStateVec(M, 0));
-        dt = sampleStep(M, f);
-        tv = sampleTimes(0.37, Pn.exposure, dt, 3000);
-        q = evalSegments({M}, 0, tv, false);
-        [X, Y] = qToScreen(q, Gn, Pn);
+        Mt = buildModel(Pn, Sn);
+        x0 = ssStatePhase(Mt, 0);
+        amp = max(sum(abs(Mt.QF(2:3, :)), 2));
+        dt = stepSize(Mt, Pn, amp);
+        rho = exp(-2 * pi * Pn.noiseCorner * dt);
+        xn = Pn.noise * sqrt(1 - rho^2) * randn(rsn, 300, 1);
+        [xe, ~, ~, rec] = integrateChunk(x0, 0, 0, 300, dt, Mt, rho, xn);
+        [X, Y] = qToScreen(rec(2:4, :), Gn, Pn);
         nTot = nTot + 1;
-        bad = any(~isfinite(X)) || any(~isfinite(Y)) || any(~isfinite(q(:))) || numel(tv) > 3000 || M.Np > 4096;
+        bad = any(~isfinite(X)) || any(~isfinite(Y)) || any(~isfinite(xe)) || ...
+            ~(dt > 0) || size(Mt.Ft, 2) > 8192;
         nBad = nBad + bad;
-        maxTh = max(maxTh, max(abs(q(2:3, :)), [], 'all'));
-        maxNs = max(maxNs, numel(tv));
+        maxTh = max(maxTh, max(abs(rec(3:4, :)), [], 'all'));
+        maxNp = max(maxNp, size(Mt.Ft, 2));
+        minDt = min(minDt, dt);
     end
 end
 fr = [1 27.5 440 20154];
 eMap = max(abs(10.^(log10(fr)) - fr) ./ fr);
 R(end + 1) = mkres(10, 'Frequency controls stable over 1 - 20,154 Hz (all waveforms)', ...
     nBad == 0 && eMap < 1e-12, nBad, ...
-    sprintf('%d frequency/waveform cases, %d invalid; max |theta| %.3g mrad; max samples/frame %d; log-slider round-trip error %.1e', ...
-    nTot, nBad, 1e3 * maxTh, maxNs, eMap));
+    sprintf('%d frequency/waveform cases integrated (nonlinear + noise), %d invalid; max |theta| %.3g mrad; table <= %d pts; min dt %.3g us; log-slider round-trip error %.1e', ...
+    nTot, nBad, 1e3 * maxTh, maxNp, 1e6 * minDt, eMap));
 
-% 11. analytic steady state + transient vs ode45 ----------------------
-Po = P; Po.f = 60; Po.wave = 'Sine'; Po.noise = 0;
+% 11. time integrator vs exact linear solution and vs ode45 (nonlinear) --
+Po = P; Po.f = 60; Po.wave = 'Sine'; Po.eta_nl = 0;
 So = buildStructure(Po);
-Mo = buildModel(Po, So, seed);
-Mo = setTransient(Mo, 0, -ssStateVec(Mo, 0));
-Fp = Mo.F; wk = 2 * pi * Mo.fk(:);
-rhs = @(tq, x) [x(4:6); Mo.M \ (real(Fp * exp(1i * wk * tq)) - Mo.K * x(1:3) - Mo.C * x(4:6))];
-opts = odeset('RelTol', 1e-9, 'AbsTol', 1e-13);
-tq = linspace(0, 0.12, 400);
-[~, xo] = ode45(rhs, tq, zeros(6, 1), opts);
-xa = zeros(6, numel(tq));
-for i = 1:numel(tq), xa(:, i) = segmentState(Mo, tq(i)); end
-scale = max(abs(xo(:, 1:3)), [], 1).';
-eOde = max(max(abs(xo(:, 1:3).' - xa(1:3, :)), [], 2) ./ scale);
-tl = rand(rs, 1, 500) * 0.1;
-ql = evalSegments({Mo}, 0, tl, false);
-qe = zeros(3, numel(tl));
-for i = 1:numel(tl), xe = segmentState(Mo, tl(i)); qe(:, i) = xe(1:3); end
-eLut = max(max(abs(ql - qe), [], 2) ./ scale);
-R(end + 1) = mkres(11, 'Analytical solution matches direct ODE integration (ode45)', ...
-    eOde < 1e-4 && eLut < 2e-2, eOde, ...
-    sprintf('60 Hz sine switched on at t=0 (mirror at rest), %d harmonic: max relative error vs ode45 %.2e; lookup-table interpolation error %.2e', ...
-    numel(Mo.n), eOde, eLut));
+Mo = buildModel(Po, So);
+Mo = setTransient(Mo, 0, -ssStateVec(Mo, 0));          % switched on at t=0, mirror at rest
+dt = stepSize(Mo, Po, 0);
+nS = round(0.12 / dt);
+[~, ~, ~, rec] = integrateChunk(zeros(6, 1), 0, 0, nS, dt, Mo, 0, zeros(nS, 1));
+qa = zeros(3, nS);
+for i = 1:nS, xa = segmentState(Mo, i * dt); qa(:, i) = xa(1:3); end
+scale = max(abs(qa), [], 2);
+eLin = max(max(abs(rec(2:4, :) - qa), [], 2) ./ scale);
+
+Pq = P; Pq.f = 380; Pq.wave = 'Sine'; Pq.eta_nl = 0.05;
+Sq = buildStructure(Pq);
+Mq = buildModel(Pq, Sq);
+x0 = ssStatePhase(Mq, 0);
+dt = stepSize(Mq, Pq, max(sum(abs(Mq.QF(2:3, :)), 2)));
+nS = round(0.05 / dt);
+[~, ~, ~, rec] = integrateChunk(x0, 0, 0, nS, dt, Mq, 0, zeros(nS, 1));
+wk = 2 * pi * Mq.fkF(:);
+FF = Mq.FF; Minv = Mq.Minv; Kq = Mq.K; Cq = Mq.C; k3 = Mq.k3;
+rhs = @(tq, x) [x(4:6); Minv * (real(FF * exp(1i * wk * tq)) - Kq * x(1:3) - Cq * x(4:6) ...
+    - k3 * (x(2)^2 + x(3)^2) * [0; x(2); x(3)])];
+opts = odeset('RelTol', 1e-10, 'AbsTol', 1e-14);
+tq = (0:nS) * dt;
+[~, xo] = ode45(rhs, tq, x0, opts);
+qo = xo(2:end, 1:3).';
+scale = max(abs(qo), [], 2);
+eNl = max(max(abs(rec(2:4, :) - qo), [], 2) ./ scale);
+R(end + 1) = mkres(11, 'Real-time integrator matches exact linear solution and ode45 (nonlinear)', ...
+    eLin < 2e-3 && eNl < 5e-3, max(eLin, eNl), ...
+    sprintf(['60 Hz sine switched on from rest (linear): max rel. error vs exact steady state + modal transient %.2e; ' ...
+    '380 Hz with contact hardening eta = 0.05: max rel. error vs ode45 %.2e (forcing-table interpolation dominates)'], eLin, eNl));
 
 % 12. 12-TET note table ---------------------------------------------
 ref = [21 27.5; 60 261.6255653; 69 440; 119 7902.132820];
@@ -1687,6 +1934,67 @@ eN = max(abs(noteFrequency(ref(:, 1)) - ref(:, 2)) ./ ref(:, 2));
 [nm, c] = nearestNote(440.5);
 R(end + 1) = mkres(12, 'Musical note frequencies (A0..B8, 12-TET)', eN < 1e-9 && strcmp(nm, 'A4'), eN, ...
     sprintf('A0, C4, A4, B8 relative error %.1e; 440.5 Hz -> %s %+.2f cents', eN, nm, c));
+
+% 13. nonlinear precession of elliptical orbits (the "3D rotation") -----
+f0 = 300; w0 = 2 * pi * f0; a = 0.02; b = 0.01;
+etaT = 0.01; beta = etaT * w0^2 / P.theta_ref^2;
+Om = beta * a * b / (4 * w0);                         % first-order averaging theory
+[omE, omZero, omLine] = deal(precessionRate(w0, beta, a, b), precessionRate(w0, 0, a, b), ...
+    precessionRate(w0, beta, a, 0));
+ratioP = abs(omE) / Om;
+R(end + 1) = mkres(13, 'Contact hardening makes elliptical orbits precess at the theoretical rate', ...
+    abs(ratioP - 1) < 0.1 && abs(omZero) < 0.01 * Om && abs(omLine) < 0.01 * Om, abs(ratioP - 1), ...
+    sprintf(['isotropic tilt pair, 300 Hz, a = 20 mrad, b = 10 mrad, eta = %.2f: measured %.3f rad/s vs ' ...
+    'beta*a*b/(4w) = %.3f rad/s (ratio %.3f); linear (eta = 0): %.2g rad/s; straight line (b = 0): %.2g rad/s'], ...
+    etaT, abs(omE), Om, ratioP, omZero, omLine));
+
+% 14. speaker harmonic distortion -------------------------------------
+Pd = P; Pd.wave = 'Sine'; Pd.f = 200; Pd.hd2 = 0.03; Pd.hd3 = 0.01;
+Md = buildModel(Pd, S0);
+r2 = abs(Md.SoS(Md.nS == 2)) / abs(Md.So1);
+r3 = abs(Md.SoS(Md.nS == 3)) / abs(Md.So1);
+Pd.hd2 = 0; Pd.hd3 = 0;
+Md0 = buildModel(Pd, S0);
+if isempty(r2), r2 = NaN; end
+if isempty(r3), r3 = NaN; end
+err = max(abs([r2 - 0.03, r3 - 0.01]));
+R(end + 1) = mkres(14, 'Harmonic distortion adds exactly the set 2f / 3f cone motion', ...
+    err < 1e-12 && isequal(Md0.nS, 1) && isequal(Md0.nF, 1), err, ...
+    sprintf('200 Hz sine: |S(2f)|/|S(f)| = %.6f (set 0.03), |S(3f)|/|S(f)| = %.6f (set 0.01); with 0%% distortion only the fundamental is present', ...
+    r2, r3));
+
+% 15. phase-continuous frequency change -------------------------------
+P1 = P; P1.f = 440; P1.wave = 'Sine'; M1 = buildModel(P1, S0);
+P2 = P; P2.f = 470; P2.wave = 'Sine'; M2 = buildModel(P2, S0);
+dt = min(stepSize(M1, P1, 0), stepSize(M2, P2, 0));
+[x1, p1, ~, rec1] = integrateChunk(ssStatePhase(M1, 0), 0, 0, 200, dt, M1, 0, zeros(200, 1));
+[~, ~, ~, rec2] = integrateChunk(x1, p1, 0, 200, dt, M2, 0, zeros(200, 1));
+u = sin(2 * pi * [rec1(1, :) rec2(1, :)]);
+du = max(abs(diff(u)));
+bound = 2 * pi * 470 * dt;
+R(end + 1) = mkres(15, 'Tone stays phase-continuous when the frequency changes', ...
+    du <= bound * 1.0001, du / bound, ...
+    sprintf('440 -> 470 Hz mid-run: largest sample-to-sample tone change %.4g vs smooth-signal bound 2*pi*f*dt = %.4g', du, bound));
+end
+
+function om = precessionRate(w0, beta, a, b)
+% Free isotropic tilt pair theta'' + w0^2 theta + beta |theta|^2 theta = 0,
+% integrated with the production RK4 routine; returns the rotation rate of
+% the orbit's apsides (rad/s).
+Mf.Ft = zeros(3, 512); Mf.A = w0^2 * eye(3); Mf.B = zeros(3); Mf.k3 = beta;
+Mf.mi2 = [0; 1; 0]; Mf.mi3 = [0; 0; 1]; Mf.f = w0 / (2 * pi);
+dt = 2 * pi / w0 / 200;
+nS = 200 * 200;
+x0 = [0; a; 0; 0; 0; b * w0];
+[~, ~, ~, rec] = integrateChunk(x0, 0, 0, nS, dt, Mf, 0, zeros(nS, 1));
+xx = rec(3, :); yy = rec(4, :); tt = (1:nS) * dt;
+rr = hypot(xx, yy);
+pk = find(rr(2:end - 1) > rr(1:end - 2) & rr(2:end - 1) >= rr(3:end)) + 1;
+ang = mod(atan2(yy(pk), xx(pk)), pi);
+d = diff(ang); d = mod(d + pi / 2, pi) - pi / 2;
+u = [ang(1), ang(1) + cumsum(d)];
+c = polyfit(tt(pk), u, 1);
+om = c(1);
 end
 
 function r = mkres(id, name, pass, metric, detail)
@@ -1700,7 +2008,7 @@ end
 function printVerification(R)
 fprintf('\n=== Laser simulator numerical verification ===\n');
 for i = 1:numel(R)
-    fprintf('%2d  %-4s  %-62s  metric = %.3g\n      %s\n', R(i).id, passFail(R(i).pass), ...
+    fprintf('%2d  %-4s  %-70s  metric = %.3g\n      %s\n', R(i).id, passFail(R(i).pass), ...
         R(i).name, R(i).metric, R(i).detail);
 end
 fprintf('%d / %d passed (internal numerical consistency only).\n\n', sum([R.pass]), numel(R));
